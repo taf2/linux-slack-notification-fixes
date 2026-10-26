@@ -14,8 +14,8 @@ activating it with the token's timestamp. The startup sequence itself is an
 X11 startup-notification one, so it is then ended with a "remove:" message,
 which stops the spinner.
 
-Slack also stops handling clicks on its notifications after a while (seconds
-to minutes) even though they stay in GNOME's tray. To cover that, Slack's
+Slack also ignores clicks on some notifications that are still in GNOME's
+tray (e.g. older ones in a conversation). To cover that, Slack's
 NEW_NOTIFICATION log entries (team/channel/message/thread) are paired by time
 with the ids GNOME returns for Slack's Notify calls (seen via a read-only
 busctl monitor). If Slack doesn't log CLICK_NOTIFICATION shortly after a

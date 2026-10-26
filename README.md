@@ -45,10 +45,11 @@ Slack itself normally handles `ActionInvoked` and opens the conversation.
 
 ### Fallback for older notifications
 
-Slack only handles clicks on fairly recent notifications. After some time
-(somewhere between under a minute and several minutes), it stops reacting to
-clicks on a notification even though GNOME still shows it in the tray. Such a
-click would raise the window but leave you wherever Slack already was.
+Slack doesn't handle clicks on every notification still shown in GNOME's
+tray. It appears to keep only the newest notification per conversation
+clickable (a 34-minute-old one worked; an older one in the same thread
+didn't), and it drops notifications for conversations you've already opened.
+Such a click would raise the window but leave you wherever Slack already was.
 
 To cover that, the helper also:
 
