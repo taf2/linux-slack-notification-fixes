@@ -1,0 +1,11 @@
+[Desktop Entry]
+Name=Slack
+StartupWMClass=Slack
+Comment=Slack Desktop
+GenericName=Slack Client for Linux
+Exec=env ELECTRON_OZONE_PLATFORM_HINT=x11 /usr/bin/slack --ozone-platform=x11 %U
+Icon=/usr/share/pixmaps/slack.png
+Type=Application
+StartupNotify=false
+Categories=GNOME;GTK;Network;InstantMessaging;
+MimeType=x-scheme-handler/slack;
