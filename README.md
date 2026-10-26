@@ -41,7 +41,26 @@ should do with the token:
 3. It broadcasts a startup-notification `remove: ID="<token>"` message on the
    root window, which ends the sequence and stops the spinner.
 
-Slack itself still handles `ActionInvoked` and opens the conversation.
+Slack itself normally handles `ActionInvoked` and opens the conversation.
+
+### Fallback for older notifications
+
+Slack only handles clicks on fairly recent notifications. After some time
+(somewhere between under a minute and several minutes), it stops reacting to
+clicks on a notification even though GNOME still shows it in the tray. Such a
+click would raise the window but leave you wherever Slack already was.
+
+To cover that, the helper also:
+
+- follows Slack's log (`journalctl --user --identifier=slack.desktop`) for
+  `Store: NEW_NOTIFICATION` entries, which include `teamId`, `channel`, `msg`
+  and `thread_ts`;
+- watches the session bus (`busctl --user monitor`) for Slack's `Notify` calls
+  and the notification id GNOME returns, and pairs those with the log entries
+  by time;
+- if Slack hasn't logged `Store: CLICK_NOTIFICATION` within 1.5 s of a click,
+  opens `slack://channel?team=…&id=…&message=…[&thread_ts=…]`, which takes
+  Slack to that message or thread.
 
 Slack must run under XWayland (`--ozone-platform=x11`) for this to work. The
 included `applications/slack.desktop` overrides the system launcher to do that.
@@ -49,7 +68,7 @@ included `applications/slack.desktop` overrides the system launcher to do that.
 ## Install
 
 ```sh
-sudo apt install x11-utils python3-gi libx11-6   # usually already present
+sudo apt install x11-utils python3-gi libx11-6 xdg-utils   # usually already present
 ./installer.sh
 ```
 
@@ -77,13 +96,16 @@ Re-run it after pulling changes. To remove everything:
 journalctl --user -u slack-notification-activate -f
 ```
 
-Each click should log `forwarded gnome-shell/Slack/…_TIME… to 0x…`.
+Each Slack notification should log `tracked notification <id> -> <channel>`,
+and each click should log `forwarded gnome-shell/Slack/…_TIME… to 0x…`. If
+Slack ignored the click, you'll also see `slack ignored click on <id>, opening slack://…`.
 
 - **No log line on click:** the service isn't running, or GNOME didn't emit
   a token (check with
   `dbus-monitor --session "interface='org.freedesktop.Notifications'"`).
 - **`no slack window`:** Slack isn't running under XWayland. Check that
   `ps -C slack -o args | grep ozone-platform=x11` shows a match.
-- **Window raises but the conversation doesn't open:** Slack didn't handle
-  `ActionInvoked`. This happened with notifications sent before a Slack
-  restart or upgrade; fresh notifications work.
+- **Window raises but the conversation doesn't open:** look for
+  `slack ignored click on untracked notification <id>`. The notification was
+  sent before the helper started (or before a Slack restart), so there is
+  nothing to deep-link to. Notifications that arrive afterwards are tracked.

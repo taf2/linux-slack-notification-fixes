@@ -34,13 +34,15 @@ do_uninstall() {
 check_deps() {
     local missing=()
     command -v xprop >/dev/null || missing+=("x11-utils (xprop)")
+    command -v busctl >/dev/null || missing+=("systemd (busctl)")
+    command -v xdg-open >/dev/null || missing+=("xdg-utils")
     /usr/bin/python3 -c 'import gi; gi.require_version("Gio", "2.0")' 2>/dev/null \
         || missing+=("python3-gi")
     /usr/bin/python3 -c 'import ctypes; ctypes.CDLL("libX11.so.6")' 2>/dev/null \
         || missing+=("libx11-6")
     if ((${#missing[@]})); then
         warn "missing dependencies: ${missing[*]}"
-        echo "    sudo apt install x11-utils python3-gi libx11-6" >&2
+        echo "    sudo apt install x11-utils python3-gi libx11-6 xdg-utils" >&2
         exit 1
     fi
     [[ "${XDG_SESSION_TYPE:-}" == wayland ]] \

@@ -13,11 +13,22 @@ _NET_STARTUP_ID. Mutter reacts to that property change on a mapped window by
 activating it with the token's timestamp. The startup sequence itself is an
 X11 startup-notification one, so it is then ended with a "remove:" message,
 which stops the spinner.
+
+Slack also stops handling clicks on its notifications after a while (seconds
+to minutes) even though they stay in GNOME's tray. To cover that, Slack's
+NEW_NOTIFICATION log entries (team/channel/message/thread) are paired by time
+with the ids GNOME returns for Slack's Notify calls (seen via a read-only
+busctl monitor). If Slack doesn't log CLICK_NOTIFICATION shortly after a
+click, the conversation is opened through a slack:// deep link instead.
 """
 
+import collections
 import ctypes
+import json
 import subprocess
+import threading
 import time
+import urllib.parse
 
 import gi
 
@@ -26,6 +37,9 @@ from gi.repository import Gio, GLib  # noqa: E402
 
 TOKEN_MARKER = "/Slack/"
 WAIT_FOR_WINDOW_SECS = 3.0
+PAIR_WINDOW_SECS = 3.0  # max gap between Slack's log entry and its Notify call
+CLICK_GRACE_MS = 1500  # how long Slack gets to handle a click itself
+MAX_TRACKED = 500
 
 
 def xprop(*args):
@@ -128,16 +142,128 @@ def forward_token(token, deadline):
     return False
 
 
-def on_signal(_conn, _sender, _path, _iface, _member, params):
-    _id, token = params.unpack()
-    if TOKEN_MARKER not in token:
-        return
-    deadline = time.monotonic() + WAIT_FOR_WINDOW_SECS
-    # Give Slack a moment to handle ActionInvoked (it may show its window).
-    GLib.timeout_add(150, lambda: forward_token(token, deadline))
+class NotificationTracker:
+    """Map GNOME notification ids to the Slack conversation they belong to.
+
+    All methods run on the GLib main loop.
+    """
+
+    def __init__(self):
+        self.entries = collections.deque()  # (time, info) from Slack's log
+        self.ids = collections.deque()  # (time, gnome id) from Notify replies
+        self.by_id = collections.OrderedDict()
+        self.last_click_logged = 0.0
+
+    def add_entry(self, info):
+        self.entries.append((time.monotonic(), info))
+        self._pair()
+
+    def add_id(self, nid):
+        self.ids.append((time.monotonic(), nid))
+        self._pair()
+
+    def _pair(self):
+        while self.entries and self.ids:
+            (te, info), (ti, nid) = self.entries[0], self.ids[0]
+            if abs(te - ti) > PAIR_WINDOW_SECS:
+                # Unpaired leftovers (e.g. a non-message notification).
+                (self.entries if te < ti else self.ids).popleft()
+                continue
+            self.entries.popleft()
+            self.ids.popleft()
+            self.by_id[nid] = info
+            while len(self.by_id) > MAX_TRACKED:
+                self.by_id.popitem(last=False)
+            print(f"tracked notification {nid} -> {info.get('channel')}", flush=True)
+
+    def check_click(self, nid, clicked_at):
+        # Slack can log the click just before we see GNOME's token.
+        if self.last_click_logged >= clicked_at - 1.0:
+            return False  # Slack handled it itself
+        info = self.by_id.get(nid)
+        if not info:
+            print(f"slack ignored click on untracked notification {nid}", flush=True)
+            return False
+        params = {"team": info["teamId"], "id": info["channel"], "message": info["msg"]}
+        if info.get("thread_ts"):
+            params["thread_ts"] = info["thread_ts"]
+        link = "slack://channel?" + urllib.parse.urlencode(params)
+        print(f"slack ignored click on {nid}, opening {link}", flush=True)
+        subprocess.Popen(["xdg-open", link], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return False
+
+
+def follow_slack_log(tracker, loop):
+    """Feed Slack's NEW_NOTIFICATION / CLICK_NOTIFICATION log lines to tracker."""
+    proc = subprocess.Popen(
+        ["journalctl", "--user", "-f", "-n", "0", "-o", "cat", "--no-pager",
+         "--identifier=slack.desktop"],
+        stdout=subprocess.PIPE, text=True, bufsize=1,
+    )
+    block = None
+    for line in proc.stdout:
+        if "Store: CLICK_NOTIFICATION" in line:
+            now = time.monotonic()
+            GLib.idle_add(lambda: setattr(tracker, "last_click_logged", now))
+        elif "Store: NEW_NOTIFICATION {" in line:
+            block = ["{"]
+        elif block is not None:
+            block.append(line)
+            if line.rstrip() == "}":
+                try:
+                    info = json.loads("".join(block))
+                except ValueError:
+                    info = {}
+                block = None
+                if all(info.get(k) for k in ("teamId", "channel", "msg")):
+                    GLib.idle_add(lambda i=info: tracker.add_entry(i))
+    print("journalctl exited", flush=True)
+    GLib.idle_add(loop.quit)
+
+
+def follow_notify_replies(tracker, loop):
+    """Feed the ids GNOME returns for Slack's Notify calls to tracker."""
+    proc = subprocess.Popen(
+        ["busctl", "--user", "monitor", "--json=short",
+         "--match", "type='method_call',interface='org.freedesktop.Notifications',member='Notify'",
+         "--match", "type='method_return'"],
+        stdout=subprocess.PIPE, text=True, bufsize=1,
+    )
+    pending = {}  # (caller, cookie) -> time
+    for line in proc.stdout:
+        try:
+            msg = json.loads(line)
+        except ValueError:
+            continue
+        if msg.get("member") == "Notify":
+            app, *_, hints, _timeout = msg["payload"]["data"]
+            # GNOME's proxy re-sends each call to the Shell; count the original only.
+            if app == "Slack" and "x-shell-sender" not in hints:
+                pending[(msg["sender"], msg["cookie"])] = time.monotonic()
+        elif msg.get("type") == "method_return" and pending:
+            if pending.pop((msg.get("destination"), msg.get("reply_cookie")), None):
+                nid = msg["payload"]["data"][0]
+                GLib.idle_add(lambda: tracker.add_id(nid))
+            cutoff = time.monotonic() - 10
+            for k in [k for k, t in pending.items() if t < cutoff]:
+                del pending[k]
+    print("busctl monitor exited", flush=True)
+    GLib.idle_add(loop.quit)
 
 
 def main():
+    tracker = NotificationTracker()
+
+    def on_token(_conn, _sender, _path, _iface, _member, params):
+        nid, token = params.unpack()
+        if TOKEN_MARKER not in token:
+            return
+        clicked_at = time.monotonic()
+        deadline = clicked_at + WAIT_FOR_WINDOW_SECS
+        # Give Slack a moment to handle ActionInvoked (it may show its window).
+        GLib.timeout_add(150, lambda: forward_token(token, deadline))
+        GLib.timeout_add(CLICK_GRACE_MS, lambda: tracker.check_click(nid, clicked_at))
+
     bus = Gio.bus_get_sync(Gio.BusType.SESSION)
     bus.signal_subscribe(
         None,
@@ -146,9 +272,13 @@ def main():
         "/org/freedesktop/Notifications",
         None,
         Gio.DBusSignalFlags.NONE,
-        on_signal,
+        on_token,
     )
-    GLib.MainLoop().run()
+    loop = GLib.MainLoop()
+    threading.Thread(target=follow_notify_replies, args=(tracker, loop), daemon=True).start()
+    threading.Thread(target=follow_slack_log, args=(tracker, loop), daemon=True).start()
+    loop.run()
+    raise SystemExit(1)
 
 
 if __name__ == "__main__":
